@@ -1,0 +1,30 @@
+---
+title: "Implementación"
+author: "MCG"
+date: "2026-05-20"
+output: html_document
+---
+
+```{r}
+library(BatchGetSymbols)
+library(readr)
+library(ggplot2)
+library(ggplotify)
+library(ggrepel)
+library(dplyr)
+library(tidyr)
+library(inspectdf)
+library(corrplot)
+library(broom)
+library(quadprog)
+library(glmnet)
+library(tidyquant)
+library(inspectdf)
+library(latex2exp)
+```
+
+
+```{r}
+url_datos_activos <- ""
+url_datos_ipc <- ""
+```
