@@ -25,6 +25,6 @@ library(latex2exp)
 
 
 ```{r}
-url_datos_activos <- ""
+url_datos_activos <- "https://raw.githubusercontent.com/marcocampg/Eigenportafolios/refs/heads/main/historico_precios_activos.csv?token=GHSAT0AAAAAAD6BPB522NEC2AWXHOJTKDNY2QWIYTQ"
 url_datos_ipc <- ""
 ```
