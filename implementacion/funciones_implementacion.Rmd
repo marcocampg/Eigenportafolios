@@ -25,8 +25,8 @@ library(latex2exp)
 
 
 ```{r}
-url_datos_activos <- "https://raw.githubusercontent.com/marcocampg/Eigenportafolios/refs/heads/main/historico_precios_activos.csv?token=GHSAT0AAAAAAD6BPB522NEC2AWXHOJTKDNY2QWIYTQ"
-url_datos_ipc <- "https://raw.githubusercontent.com/marcocampg/Eigenportafolios/refs/heads/main/historico_precios_ipc.csv?token=GHSAT0AAAAAAD6BPB5252ZVQWWSISEAUPQU2QWIZMA"
+url_datos_activos <- "https://raw.githubusercontent.com/marcocampg/Eigenportafolios/refs/heads/main/historico_precios_activos.csv"
+url_datos_ipc <- "https://raw.githubusercontent.com/marcocampg/Eigenportafolios/refs/heads/main/historico_precios_ipc.csv"
 ```
 
 # Funciones a utilizar
