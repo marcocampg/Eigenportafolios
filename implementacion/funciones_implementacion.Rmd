@@ -26,5 +26,1359 @@ library(latex2exp)
 
 ```{r}
 url_datos_activos <- "https://raw.githubusercontent.com/marcocampg/Eigenportafolios/refs/heads/main/historico_precios_activos.csv?token=GHSAT0AAAAAAD6BPB522NEC2AWXHOJTKDNY2QWIYTQ"
-url_datos_ipc <- ""
+url_datos_ipc <- "https://raw.githubusercontent.com/marcocampg/Eigenportafolios/refs/heads/main/historico_precios_ipc.csv?token=GHSAT0AAAAAAD6BPB5252ZVQWWSISEAUPQU2QWIZMA"
+```
+
+# Funciones a utilizar
+
+```{r}
+# Función para calcular media y desviación estándar de los rendimientos
+# del IPC
+# Toma un histórico en una ventana de tiempo
+# Devuelve un dataframe con rendimientos esperado y desviación
+funcion_descriptivos_ipc <- function(fecha_inicial, fecha_final)
+{
+  # Se leen los datos
+  historico_ipc <- readr::read_csv(url_datos_ipc)
+  # Se calculan los log-rendimientos
+  df_precios_ipc <- historico_ipc |> 
+    dplyr::filter(date >= fecha_inicial & date <= fecha_final) |> 
+    dplyr::select(date, price_adjusted) |>
+    dplyr::arrange(date) |> 
+    dplyr::mutate(rendimiento = log(price_adjusted / lag(price_adjusted))) |>
+    tidyr::drop_na()
+  # Se calcula la media de los rendimientos
+  media_ipc <- mean(df_precios_ipc$rendimiento)
+  # Se calcula la desviación estándar de los rendimientos
+  desv_ipc <- sd(df_precios_ipc$rendimiento)
+  ##### Este dataframe se usará para presentar al IPC en la bala riesgosa
+  ### Dataframe de la media y desviación del IPC
+  df_media_desv_ipc <- data.frame(empresa = "IPC",
+                                media = media_ipc,
+                                desv_estandar = desv_ipc)
+  return(df_media_desv_ipc)
+}
+```
+
+```{r}
+# Estimación de la matriz de la covarianzas y de rendimientos esperados
+# Toma un histórico en una ventana de tiempo
+# Devuelve una lista con la matriz de covarianzas, correlaciones y rend. esp
+funcion_matrizcov_medias <- function(fecha_inicial, fecha_final)
+{ 
+  historico_activos <- readr::read_csv(url_datos_activos)
+  df_rendimientos_activos <- historico_activos |> dplyr::group_by(symbol) |>
+  tidyquant::tq_transmute(select = adjusted,
+                          mutate_fun = periodReturn,
+                          period = "daily",
+                          type = "log",
+                          col_rename = "rendimiento") |>
+  dplyr::ungroup()
+  df_rendimientos_activos_ancha <- df_rendimientos_activos |>
+  tidyr::pivot_wider(names_from = symbol, values_from = rendimiento)
+  df_rendimientos <- df_rendimientos_activos_ancha |> 
+  dplyr::filter(date >= fecha_inicial) |>
+  dplyr::filter(date < fecha_final)
+  # Se estima la matriz de covarianzas
+  matriz_cov <- df_rendimientos |> dplyr::select(-date) |> var()
+  # Se estima la matriz de correlaciones
+  matriz_cor <- df_rendimientos |> dplyr::select(-date) |> cor()
+  # Se estima el vector de rendimientos esperados
+  vector_rend_esp <- df_rendimientos |> dplyr::select(-date) |> colMeans()
+  # Se estima un dataframe con correlaciones
+  df_correlaciones <- df_rendimientos |> dplyr::select(-date) |>
+    inspectdf::inspect_cor() |> dplyr::arrange(desc(corr))
+  return(list(matriz_cov = matriz_cov,
+              matriz_cor = matriz_cor,
+              vector_rend_esp = vector_rend_esp,
+              df_correlaciones = df_correlaciones))
+}
+```
+
+```{r}
+# Función para calcular la matriz de covarianzas
+# Bajo el modelo de un índice
+funcion_sigma_un_indice <- function(fecha_inicial, fecha_final){
+# Se leen los datos
+historico_ipc <- readr::read_csv(url_datos_ipc)
+# Se calculan los log-rendimientos
+df_rendimientos_ipc <- historico_ipc |> 
+    dplyr::filter(date >= fecha_inicial & date < fecha_final) |> 
+    dplyr::select(date, price_adjusted) |>
+    dplyr::arrange(date) |> 
+    dplyr::mutate(rendimiento = log(price_adjusted / lag(price_adjusted))) |>
+    tidyr::drop_na()
+
+# Se leen los datos
+historico_activos <- readr::read_csv(url_datos_activos)
+df_rendimientos_activos <- historico_activos |> dplyr::group_by(symbol) |>
+tidyquant::tq_transmute(select = adjusted,
+                        mutate_fun = periodReturn,
+                        period = "daily",
+                        type = "log",
+                        col_rename = "rendimiento") |>
+  dplyr::ungroup()
+df_rendimientos_activos_ancha <- df_rendimientos_activos |>
+  tidyr::pivot_wider(names_from = symbol, values_from = rendimiento)
+df_rendimientos_indiv <- df_rendimientos_activos_ancha |> 
+  dplyr::filter(date >= fecha_inicial) |>
+  dplyr::filter(date < fecha_final)
+
+names(df_rendimientos_indiv) <- stringr::str_replace(names(df_rendimientos_indiv), "MFRISCOA-1.MX",
+                                                     "MFRISCOA.MX")
+names(df_rendimientos_indiv) <- stringr::str_replace(names(df_rendimientos_indiv), "PE&OLES.MX", 
+                                                     "PENIOLES.MX")
+
+nombres <- names(df_rendimientos_indiv)
+nombres <- nombres[-1]
+
+empresas_individuales <- df_rendimientos_indiv |> 
+  dplyr::select(-date) |> names()
+
+df_rendimientos_ipc <- df_rendimientos_ipc |> dplyr::select(-price_adjusted)
+df_para_regresion <- dplyr::left_join(df_rendimientos_ipc,
+                                      df_rendimientos_indiv, by = "date")
+# Se obtiene la varianza del portafolio índice
+sigma_cuad_mercado <- var(df_para_regresion$rendimiento)
+
+# Se estimas las betas y los errores
+df_betas_errores <- data.frame()
+for(empresa in empresas_individuales){
+  formu <- paste("rendimiento ~ 0 +", empresa)
+  formu_reg <- as.formula(formu)
+  modelo_reg <- lm(formu_reg, data = df_para_regresion)
+  # Se obtiene la beta correspondiente
+  beta_modelo <- modelo_reg$coefficients
+  # Se obtiene la varianza de los residuales
+  df_resultados_reg <- broom::augment(modelo_reg)
+  sigma_cuad_error <- var(df_resultados_reg$.resid)
+  df_beta_error <- data.frame(beta = beta_modelo,
+                              sigma_cuad_error = sigma_cuad_error)
+  df_betas_errores <- rbind(df_betas_errores, df_beta_error)
+}
+
+# Se calcula el producto de las betas
+mat_sigma_parcial <- (df_betas_errores$beta) %*% t(df_betas_errores$beta)
+# Se obtiene la matriz diagonal de las varianzas de los errores
+sigma_errores <- diag(df_betas_errores$sigma_cuad_error)
+# Se calcula la matriz de covarianzas bajo el modelo de un índice
+mat_sigma_parcial <- sigma_cuad_mercado * mat_sigma_parcial
+sigma_un_indice <- mat_sigma_parcial + sigma_errores
+
+colnames(sigma_un_indice) <- nombres
+rownames(sigma_un_indice) <- nombres
+
+return(sigma_un_indice)
+}
+```
+
+```{r}
+# Función para obtener un dataframe con los rendimientos esperados y
+# desviaciones.
+# Toma la matriz de covarianzas y el vector de rendimientos esperados
+# Devuelve un dataframe con las columnas "empresa", "media",y "desv_estandar"
+funcion_df_desv_rend <- function(matriz_cov, vector_rend_esp){
+  vector_varianzas <- matriz_cov |> diag()
+  vector_desviaciones <- vector_varianzas |> sqrt()
+  df_rend_esp <- vector_rend_esp |>
+    data.frame() |> tibble::rownames_to_column()
+  df_desviaciones <- vector_desviaciones |>
+    data.frame() |> tibble::rownames_to_column()
+  df_diagrama_desv_esp <- df_rend_esp |> 
+    dplyr::left_join(df_desviaciones, by = "rowname")
+  names(df_diagrama_desv_esp) <- c("empresa", "media", "desv_estandar")
+  return(df_diagrama_desv_esp)
+}
+```
+
+```{r}
+# Función que genera los puntos de la frontera eficiente
+funcion_mallado <- function(matriz_cov, vector_rend_esp){
+  vector_varianzas <- matriz_cov |> diag()
+  vector_desviaciones <- vector_varianzas |> sqrt()
+
+  inferior <- min(vector_rend_esp) - 0.01
+  superior <- max(vector_rend_esp) + 0.01
+  mallado <- seq(from = inferior, to = superior, length = 150)
+  objetivo_medias <- c()
+  objetivo_desv <- c()
+  for(r_obj in mallado){
+    A <- cbind(rep(1, times = length(vector_rend_esp)), vector_rend_esp)
+    objeto_optimizacion <- solve.QP(Dmat = 2*matriz_cov,
+                                dvec = vector_rend_esp,
+                                Amat=A, bvec=c(1, r_obj),
+                                meq=2)
+    alpha_obj <- objeto_optimizacion$solution
+    rend_obj <- alpha_obj %*% vector_rend_esp
+    objetivo_medias <- c(objetivo_medias, rend_obj)
+    var_obj <- alpha_obj %*% matriz_cov %*% alpha_obj
+    objetivo_desv <- c(objetivo_desv, sqrt(var_obj))
+  }
+  df_mallado <- data.frame(media = objetivo_medias,
+                           desv_estandar = objetivo_desv)
+  return(df_mallado)
+}
+```
+
+```{r}
+# Función para calcular las ponderaciones del portafolio de mínima varianza
+# Recibe la matriz de covarianzas y vector de rendimientos esperados
+# Devuelve una lista con dos dataframes:
+# Uno con las ponderaciones del portafolio
+# Otro con media y desviación estándar del rendimiento del portafolio
+funcion_port_min_var <- function(matriz_cov, vector_rend_esp){
+  # Portafolio de mínima varianza
+  alpha_0 <- solve(matriz_cov, rep(1, times = nrow(matriz_cov)))
+  alpha_mv <- alpha_0/sum(alpha_0)
+  # Rendimiento portafolio mínima varianza sin restricciones
+  rend_mv <- alpha_mv %*% vector_rend_esp
+  var_mv <- alpha_mv %*% matriz_cov %*% alpha_mv
+  desv_est_mv <- sqrt(var_mv)
+
+  df_min_varianza <- data.frame(empresa = "min. var.",
+                                media = rend_mv,
+                                desv_estandar = desv_est_mv)
+
+  df_ponderaciones_mv <- data.frame(empresa = names(alpha_mv),
+                                    ponderacion_mv = alpha_mv)
+  return(list(df_min_varianza = df_min_varianza,
+              df_ponderaciones_mv = df_ponderaciones_mv))
+}
+```
+
+```{r}
+# Función para calcular las ponderaciones del portafolio de tangencia
+# Recibe la matriz de covarianzas y vector de rendimientos esperados
+# Devuelve una lista con dos dataframes:
+# Uno con las ponderaciones del portafolio
+# Otro con media y desviación estándar del rendimiento del portafolio
+funcion_port_tan <- function(matriz_cov, vector_rend_esp){
+  # Portafolio de tangencia
+  alpha_T <- solve(matriz_cov, vector_rend_esp)
+  alpha_T <- alpha_T/sum(alpha_T)
+  # Rendimiento portafolio de tangencia
+  rend_T <- alpha_T %*% vector_rend_esp
+  var_T <- alpha_T %*% matriz_cov %*% alpha_T
+  desv_est_T <- sqrt(var_T)
+
+  df_tangencia <- data.frame(empresa = "tangencia",
+                           media = abs(rend_T), desv_estandar = desv_est_T)
+
+  df_ponderaciones_T <- data.frame(empresa = names(alpha_T),
+                                   ponderacion_tang = alpha_T)
+  return(list(df_tangencia = df_tangencia,
+              df_ponderaciones_T = df_ponderaciones_T))
+}
+```
+
+
+```{r}
+# Función para obtener los eigenvalores y eigenvectores de la
+# matriz de covarianzas
+# Recibe una matriz (la de covarianzas)
+# Devuelve una lista con la matriz de eigenvectores, el vector de
+# eigenvalores, un dataframe con los eigenvectores y un dataframe
+# con los eigenvalores
+funcion_eigen <- function(matriz_cov){
+  # Se obtienen los eigenvectores de la matriz de covarianzas
+  objeto_eigen <- eigen(matriz_cov)
+  matriz_eigenvectores <- objeto_eigen$vectors
+  rownames(matriz_eigenvectores) <- rownames(estimados[['matriz_cov']])
+  # Se obtienen los eigenvalores de la matriz de covarianzas
+  eigenvalores <- objeto_eigen$values
+  # Se crea un dataframe de los eigenvectores para usarlo en las regresiones
+  df_eigenvectores <- matriz_eigenvectores |>
+    data.frame() |>
+    tibble::rownames_to_column()
+  names(df_eigenvectores)[1] <- "empresa"
+  # Se crea un dataframe de los eigenvalores para graficación
+  df_eigenvalores <- data.frame(eigenvalor = eigenvalores,
+                                num = 1:length(eigenvalores))
+  return(list("matriz_eigenvectores" = matriz_eigenvectores,
+              "eigenvalores" = eigenvalores,
+              "df_eigenvectores" = df_eigenvectores,
+              "df_eigenvalores" = df_eigenvalores))
+}
+```
+
+```{r}
+# Función que ejecuta el método de cutoff
+# Recibe un dataframe con los eigenvectores, un dataframe con los rendim
+# esperados y desviaciones de los activos y el vector de rendimientos
+# Devuelve: Dataframe con las metricas de desempeño de todas aplicar el
+# método de cutoff aumentado eigenvalores
+funcion_cutoff <- function(df_eigenvectores, df_desv_rend, vector_rend_esp){
+  # Se crea un dataframe para las regresiones
+  df_regresiones <- df_desv_rend |> 
+    dplyr::left_join(df_eigenvectores, by = "empresa")
+  
+  df_regresiones <- df_regresiones |> dplyr::select(-desv_estandar)
+  
+  numero_componentes <- nrow(df_regresiones)
+  # Se genera un dataframe para ir guardando los resultados de todas las regresiones
+  df_metricas_spec_cutoff <- data.frame()
+  # Se calcula la norma del vector de primas de riesgo
+  denominador <- norm(vector_rend_esp, type = "2")
+  
+  # Definimos la base de la fórmula
+  base <- "vector_rend_esp ~ 0"
+  
+  # Ciclo for para hacer todas las regresiones para cut-off
+  for (i in 1:numero_componentes){
+    pcs <- paste0("X", 1:i, collapse = " + ")
+    formu <- paste(base, pcs, sep = " + ")
+    formu_reg <- as.formula(formu)
+    # Se aplica una regresión
+    modelo_reg <- lm(formu_reg, data = df_regresiones)
+    numerador <- norm(modelo_reg$residuals, type = "2")
+    # Se calcula el % de error de aproximación del vector de primas de riesgo
+    delta_error <- numerador/denominador
+    df_delta_error <- data.frame(num_comps = i, delta = delta_error)
+    # Se obtienen las métricas de cada regresión
+    df_metricas_reg <- broom::glance(modelo_reg)
+    df_metricas_reg <- cbind(df_delta_error, df_metricas_reg)
+    # Se arma el dataframe con info de cada regresión
+    df_metricas_spec_cutoff <- rbind(df_metricas_spec_cutoff, 
+                                     df_metricas_reg)
+    }
+  return(df_metricas_spec_cutoff)
+  }
+```
+
+
+```{r}
+# Función para aplicar el método de cutoff para varios valores de k
+# Toma el vector de rendimientos esperados, la matriz de eigenvectores
+# el vector de eigenvalores
+# Devuelve dos dataframes:
+# Uno con los rendims. esperados y desv. para cada aproximación
+# Otro con las ponderaciones de cada portafolio de máx Sharpe
+funcion_max_sharpe_cutoff <- function(vector_rend_esp,
+                                     matriz_eigenvectores,
+                                     eigenvalores){
+  # En df_ports_aprox se guardarán los rendimientos y desviaciones
+  # estándar de los portafolios de max Sharpe con matriz aproximada
+  df_ports_aprox <- data.frame()
+  # En df_ports_aprox se guardarán las ponderaciones de cada portafolio
+  # de max Sharpe con matriz aproximada
+  df_ponds_ports_aprox <- data.frame(rowname = names(vector_rend_esp))
+  for(k in 50:72){
+  # Los primeros k eigenvalores
+  pos_eigenvector <- seq(1,k)
+  # Los primeros k eigenvectores
+  eigenvect_trunc <- matriz_eigenvectores[,pos_eigenvector]
+  eigenvalores_inversos <- 1/eigenvalores[pos_eigenvector]
+  # Inversa truncada a k eingenvectores
+  inversa_truncada <- eigenvalores_inversos |> diag()
+  # Aproximación de la matriz de covarianzas usando k eigenvectores
+  sigma_inv_trunc <- eigenvect_trunc %*% inversa_truncada %*% t(eigenvect_trunc)
+  # Ponderación del portafolio de máximo Sharpe con matriz aproximada
+  alfa_trunc <- sigma_inv_trunc %*% vector_rend_esp |> as.numeric()
+  names(alfa_trunc) <- names(vector_rend_esp)
+  # Se calculan las ponderaciones del portafolio cuasi-óptimo
+  alfa_trunc <- alfa_trunc/sum(alfa_trunc)
+  # Se calcula el rendimiento esperado del portafolio cuasi-óptimo
+  rend_trunc <- alfa_trunc %*% vector_rend_esp
+  # Se calcula la varianza del portafolio cuasi-óptimo
+  var_trunc <- alfa_trunc %*% matriz_cov %*% alfa_trunc
+  desv_est_trunc <- sqrt(var_trunc)
+  renglon <- c(k, rend_trunc, desv_est_trunc)
+  df_ports_aprox <- rbind(df_ports_aprox, renglon)
+  # Se le cambia el nombre a las columnas para mayor orden
+  names(df_ports_aprox) <- c("empresa", "media", "desv_estandar")
+  # Se convierte a string el nombre de la k de aproximación
+  df_ports_aprox <- df_ports_aprox |> 
+    dplyr::mutate(empresa = as.character(empresa))
+  
+  # Se registran las ponderaciones
+  # Se crea un dataframe con las ponderaciones
+  df_ponds_trunc <- data.frame(alfa_trunc)
+  nombre_columna <- paste0("ponderacion",k)
+  names(df_ponds_trunc) <- nombre_columna
+  df_ponds_trunc <- df_ponds_trunc |> tibble::rownames_to_column()
+  df_ponds_ports_aprox <- dplyr::left_join(df_ponds_ports_aprox,
+                                           df_ponds_trunc, by = "rowname")
+  }
+  
+  # Se le cambia el nombre a la primera columna para mayor orden
+  names(df_ponds_ports_aprox)[1] <- "empresa"
+  return(list(df_ports_aprox = df_ports_aprox,
+              df_ponds_ports_aprox = df_ponds_ports_aprox))
+}
+```
+
+```{r}
+# Función para obtener el portafolio LASSO
+funcion_lasso <- function(df_eigenvectores,
+                          df_desv_rend,
+                          vector_rend_esp,
+                          matriz_eigenvectores,
+                          eigenvalores){
+# Se crea un dataframe para las regresiones
+df_regresiones <- df_desv_rend |> 
+  dplyr::left_join(df_eigenvectores, by = "empresa")
+  
+df_regresiones <- df_regresiones |> dplyr::select(-desv_estandar)
+
+y_var <- df_regresiones$media
+x_vars <- df_regresiones |> 
+  dplyr::select(-empresa, -media) |> 
+  as.matrix()
+
+set.seed(12345)
+cv_output <- glmnet::cv.glmnet(x_vars, y_var,
+                               intercept = FALSE,
+                               nfolds = 12,
+                               alpha = 1) # alpha = 1 para indicar LASSO
+
+# Identificación de la mejor gamma
+best_lambda <- cv_output$lambda.min
+# Dataframe de los resultados de validación cruzada LASSO para graficación
+df_cv_lasso <- broom::tidy(cv_output)
+
+# Reconstrucción del modelo con la mejor lambda identificada
+lasso_best <- glmnet(x_vars, y_var, alpha = 1,
+                     lambda = best_lambda,
+                     intercept = FALSE)
+# Dataframe resumen de la regresión LASSO
+df_resumen_lasso <- broom::tidy(lasso_best)
+
+# Vector de eigenvectores seleccionados
+char_vec <- df_resumen_lasso$term
+
+# Quitar el primer caracter de cada string
+char_vec_new <- substring(char_vec, first = 2, last = nchar(char_vec))
+pos_eigenvector <- as.numeric(char_vec_new) |> sort()
+
+# Se toman los eigenvectores seleccionados
+eigenvect_trunc <- matriz_eigenvectores[,pos_eigenvector]
+# Se toman los eigenvalores seleccionados
+eigenvalores_inversos <- 1/eigenvalores[pos_eigenvector]
+# Se construye la matriz inversa de la diagonal
+inversa_truncada <- eigenvalores_inversos |> diag()
+# Se construye la matriz de covarianzas aproximada
+sigma_inv_trunc <- eigenvect_trunc %*% inversa_truncada %*% t(eigenvect_trunc)
+
+# Portafolio LASSO
+alfa_trunc <- as.numeric(sigma_inv_trunc %*% vector_rend_esp)
+alfa_trunc <- alfa_trunc/sum(alfa_trunc)
+names(alfa_trunc) <- names(vector_rend_esp)
+
+# Rendimiento portafolio LASSO
+rend_lasso <- as.numeric(alfa_trunc %*% vector_rend_esp)
+# Varianza y desviación estándar portafolio LASSO
+var_lasso <- as.numeric(alfa_trunc %*% matriz_cov %*% alfa_trunc)
+desv_est_lasso <- sqrt(var_lasso)
+# Se construye un dataframe con rend. esperado y desv. del port LASSO
+df_port_lasso <- data.frame(empresa = "sel. espectral",
+                            media = rend_lasso,
+                            desv_estandar = desv_est_lasso)
+# Se construye un portafolio con las ponderaciones del portafolio LASSO
+df_ponderaciones_lasso <- data.frame(empresa = names(alfa_trunc),
+                                     ponderacion_espect = alfa_trunc)
+
+return(list(best_lambda = best_lambda,
+            df_cv_lasso = df_cv_lasso,
+            df_resumen_lasso = df_resumen_lasso,
+            pos_eigenvector = pos_eigenvector,
+            df_port_lasso = df_port_lasso,
+            df_ponderaciones_lasso = df_ponderaciones_lasso))
+}
+```
+
+```{r}
+funcion_calcula_eigenportafolios <- function(matriz_eigenvectores,
+                                             vector_rend_esp,
+                                             matriz_cov){
+  
+# Se crean las ponderaciones de los eigenportafolios
+matriz_eigenportafolios <- apply(matriz_eigenvectores, 2,
+                                 function(x) x / sum(x))
+
+# Se arma un dataframe con el rendimiento esperado y desv. est
+# de cada eigenportafolio
+df_eigens <- data.frame()
+df_ponds_eigens <- data.frame(rowname = names(vector_rend_esp))
+for(j in 1:20){
+  alfa_eigen <- matriz_eigenportafolios[,j]
+  # Se calcula el rendimiento esperado del eigenportafolio
+  rend_eigen <- alfa_eigen %*% vector_rend_esp
+  # Se calcula la varianza del eigenportafolio
+  var_eigen <- alfa_eigen %*% matriz_cov %*% alfa_eigen
+  # Se calcula la desviación del eigenportafolio
+  desv_est_eigen <- sqrt(var_eigen)
+  renglon <- c(j, j, rend_eigen, desv_est_eigen)
+  df_eigens <- rbind(df_eigens, renglon)
+  
+  # Se registran las ponderaciones
+  # Se crea un dataframe con las ponderaciones
+  df_ponds_eig <- data.frame(alfa_eigen)
+  nombre_columna <- paste0("eigenportafolio",j)
+  names(df_ponds_eig) <- nombre_columna
+  df_ponds_eig <- df_ponds_eig |> tibble::rownames_to_column()
+  df_ponds_eigens <- dplyr::left_join(df_ponds_eigens, df_ponds_eig,
+                                    by = "rowname")
+}
+
+names(df_eigens) <- c("numero", "empresa", "media", "desv_estandar")
+df_eigens <- df_eigens |> dplyr::mutate(empresa = as.character(empresa))
+df_eigens <- df_eigens |>
+  dplyr::mutate(empresa = paste0("eigenportafolio",empresa))
+  
+names(df_ponds_eigens)[1] <- "empresa"
+
+return(list(df_eigens = df_eigens,
+            df_ponds_eigens = df_ponds_eigens))
+}
+```
+
+## Funciones de graficación
+
+```{r}
+funcion_graficacion_correlaciones <- function(df_correlaciones){
+graf_correls <- df_correlaciones |> ggplot() +
+  geom_density(aes(x = corr), color = "darkcyan") +
+  labs(y = "", x = "Correlación") +
+  theme_light()
+return(graf_correls)
+}
+```
+
+```{r}
+# Función para graficar la frontera eficiente
+# Recibe
+# Devuelve una gráfica con la bala
+funcion_graficacion_desv_media <- function(df_descriptivos_ipc,
+                                           matriz_cov, vector_rend_esp,
+                                           df_desv_rend,
+                                           objeto_tan,
+                                           objeto_min_var,
+                                           df_mv_index,
+                                           df_tan_index
+                                           ){
+  df_mallado <- funcion_mallado(matriz_cov, vector_rend_esp)
+  df_ports_especiales <- rbind(objeto_tan[['df_tangencia']],
+                               objeto_min_var[['df_min_varianza']],
+                               df_descriptivos_ipc,
+                               df_tan_index,
+                               df_mv_index)
+  df_desv_rend <- df_desv_rend |> dplyr::arrange(media) |> head(n = 10)
+  grafica <- df_mallado |> ggplot() +
+  geom_point(aes(x = desv_estandar, y = media),
+             color = "blue", size = 0.5) +
+  geom_point(data = df_ports_especiales,
+             aes(x = desv_estandar, y = media, color = empresa),
+             size = 2) +
+  geom_label_repel(data = df_ports_especiales,
+                   aes(x = desv_estandar,
+                       y = media,
+                       label = empresa),
+                  box.padding = 0.5, point.padding = 0.6,
+                  size = 2.5, segment.color = 'grey50') +
+  geom_point(data = df_desv_rend,
+             aes(x = desv_estandar, y = media, color = empresa),
+             size = 2) +
+  geom_label_repel(data = df_desv_rend,
+                   aes(x = desv_estandar,
+                       y = media,
+                       label = empresa),
+                  box.padding = 0.5, point.padding = 0.6,
+                  max.overlaps = Inf,
+                  size = 2.5, segment.color = 'grey50') +
+  #ggtitle("Diagrama desviación estándar & media") +
+  xlab("Desviación estándar") +
+  ylab("Media") +
+  theme_light() +
+  theme(legend.position = "none")
+  return(grafica)
+}
+```
+
+```{r}
+# Función graficar el BIC, AIC, R^2 de cada regresión del método cutoff
+# Recibe la tabla de métricas del método cutoff
+# Devuelve una lista con cuatro gráficas
+funcion_graficos_cutoff_delta <- function(df_metricas_spec_cutoff,
+                                          nivel_error = 0.15,
+                                          cruce_delta = 60,
+                                          cruce_aic = 60,
+                                          cruce_bic = 60,
+                                          cruce_rcuad = 60
+                                          ){
+  numero_componentes <- nrow(df_metricas_spec_cutoff)
+  # Gráfico del error de aproximación
+  p1 <- df_metricas_spec_cutoff |> ggplot() +
+    geom_line(aes(x = num_comps, y = delta), color = "grey") +
+    geom_point(aes(x = num_comps, y = delta), color = "red",
+               size = 1, alpha = 0.5) +
+    geom_hline(yintercept = nivel_error, color = "blue",
+               linetype = "dashed", linewidth = 0.5) +
+    geom_vline(xintercept = cruce_delta, color = "blue",
+               linetype = "dashed", linewidth = 0.5) +
+    scale_x_continuous(breaks = 1:numero_componentes) +
+    xlab("") +
+    theme_light() +
+    theme(axis.text.x = element_text(size = 6, angle = 80))
+  # Gráfico de las AICs de cada regresión
+  p2 <- df_metricas_spec_cutoff |> ggplot() +
+    geom_line(aes(x = num_comps, y = AIC), color = "grey") +
+    geom_point(aes(x = num_comps, y = AIC), color = "red",
+               size = 1, alpha = 0.5) +
+    geom_vline(xintercept = cruce_aic, color = "blue",
+               linetype = "dashed", linewidth = 0.5) +
+    scale_x_continuous(breaks = 1:numero_componentes) +
+    xlab("") +
+    theme_light() +
+    theme(axis.text.x = element_text(size = 6, angle = 80))
+  # Gráfico de los BICs de cada regresión
+  p3 <- df_metricas_spec_cutoff |> ggplot() +
+    geom_line(aes(x = num_comps, y = BIC), color = "grey") +
+    geom_point(aes(x = num_comps, y = BIC), color = "red",
+               size = 1, alpha = 0.5) +
+    geom_vline(xintercept = cruce_bic, color = "blue",
+               linetype = "dashed", linewidth = 0.5) +
+    scale_x_continuous(breaks = 1:numero_componentes) +
+    xlab("") +
+    theme_light() +
+    theme(axis.text.x = element_text(size = 6, angle = 80))
+  # Gráfico de las R^2 de cada regresión
+  p4 <- df_metricas_spec_cutoff |> ggplot() +
+    geom_line(aes(x = num_comps, y = r.squared), color = "grey") +
+    geom_point(aes(x = num_comps, y = r.squared), color = "red",
+               size = 1, alpha = 0.5) +
+    geom_vline(xintercept = cruce_rcuad, color = "blue",
+               linetype = "dashed", linewidth = 0.5) +
+    scale_x_continuous(breaks = 1:numero_componentes) +
+    ylab("R cuadrada") + xlab("") +
+    theme_light() +
+    theme(axis.text.x = element_text(size = 6, angle = 80))
+  return(list("grafico_delta" = p1, "grafico_aic" = p2,
+              "grafico_bic" = p3, "grafico_r2" = p4))
+}
+```
+
+```{r}
+# Función para graficar la frontera eficiente con la aproximaciones
+# del portafolio de Sharpe
+# Devuelve una gráfica con la bala
+funcion_graficacion_desv_media_cutoff <- function(df_descriptivos_ipc,
+                                           matriz_cov, vector_rend_esp,
+                                           df_desv_rend,
+                                           objeto_tan,
+                                           objeto_min_var,
+                                           df_mv_index,
+                                           df_tan_index,
+                                           k_min,
+                                           k_max,
+                                           df_ports_aprox,
+                                           df_port_lasso
+                                           ){
+  df_mallado <- funcion_mallado(matriz_cov, vector_rend_esp)
+  df_desv_esp_cutoff <- df_ports_aprox |> 
+    dplyr::mutate(empresa = as.character(empresa)) |>
+    dplyr::filter(empresa >= k_min & empresa <= k_max) |>
+    dplyr::mutate(empresa = as.numeric(empresa))
+  df_ports_especiales <- rbind(objeto_tan[['df_tangencia']],
+                               objeto_min_var[['df_min_varianza']],
+                               df_descriptivos_ipc,
+                               df_tan_index,
+                               df_mv_index,
+                               df_desv_esp_cutoff,
+                               df_port_lasso)
+  df_desv_rend <- df_desv_rend |> dplyr::arrange(media) |> head(n = 1)
+  grafica <- df_mallado |> ggplot() +
+  geom_point(aes(x = desv_estandar, y = media),
+             color = "blue", size = 0.5) +
+  geom_point(data = df_ports_especiales,
+             aes(x = desv_estandar, y = media, color = empresa),
+             size = 2) +
+  geom_label_repel(data = df_ports_especiales,
+                   aes(x = desv_estandar,
+                       y = media,
+                       label = empresa),
+                  box.padding = 0.5, point.padding = 0.6,
+                  max.overlaps = Inf,
+                  size = 2.5, segment.color = 'grey50') +
+  geom_point(data = df_desv_rend,
+             aes(x = desv_estandar, y = media, color = empresa),
+             size = 2) +
+  geom_label_repel(data = df_desv_rend,
+                   aes(x = desv_estandar,
+                       y = media,
+                       label = empresa),
+                  box.padding = 0.5, point.padding = 0.6,
+                  max.overlaps = Inf,
+                  size = 2.5, segment.color = 'grey50') +
+  #ggtitle("Diagrama desviación estándar & media") +
+  xlab("Desviación estándar") +
+  ylab("Media") +
+  theme_light() +
+  theme(legend.position = "none")
+  return(grafica)
+}
+```
+
+
+```{r}
+funcion_graficacion_cv_lasso <- function(df_cv_lasso, best_lambda){
+  
+lambda_decimal <- format(best_lambda, scientific = FALSE)
+  
+grafica <- df_cv_lasso |> ggplot() +
+  geom_vline(xintercept = log(best_lambda),
+             linetype = "dotdash",
+             color = "royalblue") +
+  # Añadimos los intervalos de confianza
+  geom_errorbar(aes(x = log(lambda), ymin = conf.low, ymax = conf.high), 
+                width = 0.05,
+                alpha = 0.5,
+                color = "lightskyblue3") +
+  geom_point(aes(x = log(lambda), y = estimate), size = 1, color = "darkorange1") +
+  labs(title = "Selección del parámetro de regularización",
+       subtitle = bquote("Parámetro:" ~ gamma ~ "=" ~ .(lambda_decimal))) +
+  xlab(expression(log(gamma))) +
+  ylab("Error medio") +
+  theme_light()
+  return(grafica)
+}
+```
+
+```{r}
+# Función para graficar la frontera eficiente y los eigenportafolios
+# Devuelve una gráfica con la bala
+funcion_graficacion_eigenportafolios <- function(df_descriptivos_ipc,
+                                           matriz_cov, vector_rend_esp,
+                                           df_desv_rend,
+                                           objeto_tan,
+                                           objeto_min_var,
+                                           df_mv_index,
+                                           df_tan_index,
+                                           k_min,
+                                           k_max,
+                                           df_ports_aprox,
+                                           cjto_k,
+                                           df_eigens,
+                                           df_port_lasso
+                                           ){
+  df_mallado <- funcion_mallado(matriz_cov, vector_rend_esp)
+  df_desv_esp_cutoff <- df_ports_aprox |> 
+    dplyr::mutate(empresa = as.character(empresa)) |>
+    dplyr::filter(empresa >= k_min & empresa <= k_max) |>
+    dplyr::mutate(empresa = as.numeric(empresa))
+  df_desv_esp_eig <- df_eigens |> dplyr::filter(numero %in% cjto_k) |>
+    dplyr::select(-numero)
+  df_ports_especiales <- rbind(objeto_tan[['df_tangencia']],
+                               objeto_min_var[['df_min_varianza']],
+                               df_descriptivos_ipc,
+                               df_desv_esp_cutoff,
+                               df_desv_esp_eig,
+                               df_port_lasso)
+  df_desv_rend <- df_desv_rend |> dplyr::arrange(media) |> head(n = 1)
+  grafica <- df_mallado |> ggplot() +
+  geom_point(aes(x = desv_estandar, y = media),
+             color = "blue", size = 0.5) +
+  geom_point(data = df_ports_especiales,
+             aes(x = desv_estandar, y = media, color = empresa),
+             size = 2) +
+  geom_label_repel(data = df_ports_especiales,
+                   aes(x = desv_estandar,
+                       y = media,
+                       label = empresa),
+                  box.padding = 0.5, point.padding = 0.6,
+                  max.overlaps = Inf,
+                  size = 2.5, segment.color = 'grey50') +
+  geom_point(data = df_desv_rend,
+             aes(x = desv_estandar, y = media, color = empresa),
+             size = 2) +
+  geom_label_repel(data = df_desv_rend,
+                   aes(x = desv_estandar,
+                       y = media,
+                       label = empresa),
+                  box.padding = 0.5, point.padding = 0.6,
+                  max.overlaps = Inf,
+                  size = 2.5, segment.color = 'grey50') +
+  #ggtitle("Diagrama desviación estándar & media") +
+  xlab("Desviación estándar") +
+  ylab("Media") +
+  theme_light() +
+  theme(legend.position = "none")
+  return(grafica)
+}
+```
+
+```{r}
+funcion_graficacion_ponderaciones <- function(df_ponderaciones_mv,
+                                              df_ponderaciones_T,
+                                              df_ponds_ports_aprox,
+                                              df_ponderaciones_lasso, k_min, k_max)
+  {
+columnas_seleccionadas <- paste0("ponderacion", k_min:k_max)
+columnas_seleccionadas <- c("empresa", columnas_seleccionadas)
+df_ponds_ports_aprox <- df_ponds_ports_aprox |>
+  dplyr::select(all_of(columnas_seleccionadas))
+
+df_ponderaciones_integrado <- df_ponderaciones_mv |> 
+  dplyr::left_join(df_ponds_ports_aprox, by = "empresa") |>
+  dplyr::left_join(df_ponderaciones_lasso, by = "empresa") |>
+  dplyr::left_join(df_ponderaciones_T, by = "empresa")
+
+orden_deseado <- names(df_ponderaciones_integrado)[-1]
+
+df_ponderaciones_integrado_largo <- df_ponderaciones_integrado |> 
+  tidyr::pivot_longer(cols = starts_with("ponderacion"), 
+                        names_to = "portafolio", 
+                        values_to = "ponderacion")
+
+df_ponderaciones_integrado_largo$portafolio <- factor(df_ponderaciones_integrado_largo$portafolio, levels = orden_deseado)
+
+df_ponderaciones_integrado_largo$empresa <- forcats::fct_reorder(df_ponderaciones_integrado_largo$empresa, df_ponderaciones_integrado_largo$ponderacion, .fun = mean)
+
+grafica <- df_ponderaciones_integrado_largo |>
+  ggplot() +  geom_tile(aes(x = portafolio, y = empresa, fill=ponderacion)) +
+  scale_fill_distiller(palette = "Spectral", direction = 1) +
+  ylab("") + xlab("") +
+  theme_light() +
+  theme(axis.text.y = element_text(size = 4)) +
+  theme(axis.text.x = element_text(size = 5, angle = 20))
+
+return(grafica)
+}
+```
+
+```{r}
+funcion_grafic_pond_largas_cortas <- function(df_ponderaciones_mv,
+                                            df_ponderaciones_T,
+                                            df_ponds_ports_aprox,
+                                            df_ponderaciones_lasso,
+                                            k_min = 60, k_max = 70){
+columnas_seleccionadas <- paste0("ponderacion", k_min:k_max)
+columnas_seleccionadas <- c("empresa", columnas_seleccionadas)
+df_ponds_ports_aprox <- df_ponds_ports_aprox |>
+  dplyr::select(all_of(columnas_seleccionadas))
+
+df_ponderaciones_integrado <- df_ponderaciones_mv |> 
+  dplyr::left_join(df_ponds_ports_aprox, by = "empresa") |>
+  dplyr::left_join(df_ponderaciones_lasso, by = "empresa") |>
+  dplyr::left_join(df_ponderaciones_T, by = "empresa")
+
+orden_deseado <- names(df_ponderaciones_integrado)[-1]
+
+df_ponderaciones_integrado_largo <- df_ponderaciones_integrado |> 
+  tidyr::pivot_longer(cols = starts_with("ponderacion"), 
+                        names_to = "portafolio", 
+                        values_to = "ponderacion")
+
+df_ponderaciones_integrado_largo$portafolio <- factor(df_ponderaciones_integrado_largo$portafolio, levels = orden_deseado)
+
+df_ponderaciones_integrado_largo$empresa <- forcats::fct_reorder(df_ponderaciones_integrado_largo$empresa, df_ponderaciones_integrado_largo$ponderacion, .fun = mean)
+
+pond_ordenacion <- paste0("ponderacion",k_max)
+
+bajas_proporciones <- df_ponds_ports_aprox |> 
+  dplyr::select(empresa, pond_ordenacion) |> 
+  dplyr::arrange(pond_ordenacion) |> head(15)
+bajas_proporciones <- bajas_proporciones$empresa
+
+altas_proporciones <- df_ponds_ports_aprox |>
+  dplyr::select(empresa, pond_ordenacion) |> 
+  dplyr::arrange(pond_ordenacion) |> tail(15)
+altas_proporciones <- altas_proporciones$empresa
+
+graf_pond_largas <- df_ponderaciones_integrado_largo |> dplyr::filter(empresa %in% altas_proporciones) |>
+  ggplot() +  geom_tile(aes(x = portafolio, y = empresa, fill=ponderacion)) +
+  scale_fill_gradient(high = "darkcyan", low = "white") +
+  ylab("") + xlab("") +
+  theme_light() +
+  theme(axis.text.y = element_text(size = 8)) +
+  theme(axis.text.x = element_text(size = 7, angle = 15)) +
+  theme(legend.position = "none")
+
+graf_pond_cortas <- df_ponderaciones_integrado_largo |> dplyr::filter(empresa %in% bajas_proporciones) |>
+  ggplot() +  geom_tile(aes(x = portafolio, y = empresa, fill=ponderacion)) +
+  scale_fill_gradient(high = "white", low = "red") +
+  ylab("") + xlab("") +
+  theme_light() +
+  theme(axis.text.y = element_text(size = 8)) +
+  theme(axis.text.x = element_text(size = 7, angle = 15)) +
+  theme(legend.position = "none")
+
+return(list("graf_pond_largas" = graf_pond_largas,
+            "graf_pond_cortas" = graf_pond_cortas))
+}
+```
+
+```{r}
+funcion_errores_aprox <- function(eigenvalores,
+                                  cruce_prop = 61,
+                                  cruce_frob = 34)
+  {
+suma_total <- sum(eigenvalores)
+prop_explicacion <- cumsum(eigenvalores)/suma_total
+df_prop_explicacion <- data.frame(k = 1:length(prop_explicacion),
+                                  prop_explicacion = prop_explicacion)
+
+graf_prop_expl <- df_prop_explicacion |> ggplot() +
+    geom_line(aes(x = k, y = prop_explicacion), color = "grey") +
+    geom_point(aes(x = k, y = prop_explicacion), color = "red",
+               size = 1, alpha = 0.5) +
+  geom_hline(yintercept = 0.95, color = "blue",
+               linetype = "dashed", linewidth = 0.5) +
+  geom_vline(xintercept = cruce_prop, color = "blue",
+               linetype = "dashed", linewidth = 0.5) +
+  scale_x_continuous(breaks = 1:length(prop_explicacion)) +
+    xlab("") + ylab("Proporción de energía") +
+    theme_light() +
+    theme(axis.text.x = element_text(size = 6, angle = 80))
+
+long <- length(eigenvalores)
+ev_sorted <- sort(eigenvalores, decreasing = TRUE)
+ev_sq <- ev_sorted^2
+suma_cuad <- sum(ev_sq)
+error_frob_todos <- rev(cumsum(rev(ev_sq)))[-1]
+error_frob <- error_frob_todos/suma_cuad
+df_frob <- data.frame(k = 1:(long-1), error_frob = error_frob)
+
+graf_error_frobenius <- df_frob |> ggplot() +
+    geom_line(aes(x = k, y = error_frob), color = "grey") +
+    geom_point(aes(x = k, y = error_frob), color = "red",
+               size = 1, alpha = 0.5) +
+  geom_hline(yintercept = 0.05, color = "blue",
+               linetype = "dashed", linewidth = 0.5) +
+    geom_vline(xintercept = cruce_frob, color = "blue",
+               linetype = "dashed", linewidth = 0.5) +
+  scale_x_continuous(breaks = 1:(long-1)) +
+    xlab("") + ylab("Error de Frobenius relativo") +
+    theme_light() +
+    theme(axis.text.x = element_text(size = 6, angle = 80))
+
+return(list("graf_prop_expl" = graf_prop_expl,
+            "graf_error_frobenius" = graf_error_frobenius))
+}
+```
+
+
+```{r}
+## 
+funcion_graf_altasbajas_corr <- function(df_correlaciones)
+{
+df_alta_correlacion <- df_correlaciones |> dplyr::filter(corr >= 0.5)
+
+primera_lista_alta_corr <- df_alta_correlacion$col_1
+segunda_lista_alta_corr <- df_alta_correlacion$col_2
+acc_alta_corr <- c(primera_lista_alta_corr, segunda_lista_alta_corr)
+acc_alta_corr <- unique(acc_alta_corr)
+
+df_baja_correlacion <- df_correlaciones |> dplyr::filter(corr <= -0.07)
+
+primera_lista_baja_corr <- df_baja_correlacion$col_1
+segunda_lista_baja_corr <- df_baja_correlacion$col_2
+acc_baja_corr <- c(primera_lista_baja_corr, segunda_lista_baja_corr)
+acc_baja_corr <- unique(acc_baja_corr)
+
+expr_alta <- bquote(
+    matriz_cor[.(acc_alta_corr), .(acc_alta_corr)] |>
+      corrplot(type = 'lower', order = 'hclust', tl.col = 'grey50',
+               cl.ratio = 0.2, tl.srt = 45, col = COL1('YlGn'),
+               addCoef.col = 'orange')
+  )
+  grafico_corr_alta <- ggplotify::as.ggplot(as.expression(expr_alta))
+  
+  # 4. Gráfico Baja Correlación (Inyectando el valor real de 'acc_baja_corr')
+  expr_baja <- bquote(
+    matriz_cor[.(acc_baja_corr), .(acc_baja_corr)] |>
+      corrplot(type = 'lower', order = 'hclust', tl.col = 'grey50',
+               cl.ratio = 0.2, tl.srt = 45, col = COL1('YlGn'),
+               addCoef.col = 'orange')
+  )
+  grafico_corr_baja <- ggplotify::as.ggplot(as.expression(expr_baja))
+  
+return(list("grafico_corr_alta" = grafico_corr_alta,
+            "grafico_corr_baja" = grafico_corr_baja))
+}
+```
+
+```{r}
+funcion_graf_verdesrojos <- function(df_descriptivos_ipc,
+                                           matriz_cov, vector_rend_esp,
+                                           df_desv_rend,
+                                           objeto_tan,
+                                           objeto_min_var,
+                                           df_mv_index,
+                                           df_tan_index,
+                                           k_min = 65,
+                                           k_max = 70,
+                                           df_ports_aprox,
+                                           df_port_lasso
+                                           ){
+  
+pond_ordenacion <- paste0("ponderacion",k_max)
+
+bajas_proporciones <- df_ponds_ports_aprox |> 
+  dplyr::select(all_of(c("empresa", pond_ordenacion))) |> 
+  dplyr::arrange(pond_ordenacion) |> head(3)
+bajas_proporciones <- bajas_proporciones$empresa
+df_empresas_bajas <- df_desv_rend |> 
+  dplyr::filter(empresa %in% bajas_proporciones)
+
+altas_proporciones <- df_ponds_ports_aprox |>
+  dplyr::select(all_of(c("empresa", pond_ordenacion))) |> 
+  dplyr::arrange(pond_ordenacion) |> tail(3)
+altas_proporciones <- altas_proporciones$empresa
+df_empresas_altas <- df_desv_rend |> 
+  dplyr::filter(empresa %in% altas_proporciones)
+
+df_mallado <- funcion_mallado(matriz_cov, vector_rend_esp)
+  df_desv_esp_cutoff <- df_ports_aprox |> 
+    dplyr::mutate(empresa = as.character(empresa)) |>
+    dplyr::filter(empresa >= k_min & empresa <= k_max) |>
+    dplyr::mutate(empresa = as.numeric(empresa))
+  df_ports_especiales <- rbind(objeto_tan[['df_tangencia']],
+                               objeto_min_var[['df_min_varianza']],
+                               df_descriptivos_ipc,
+                               df_tan_index,
+                               df_mv_index,
+                               df_desv_esp_cutoff,
+                               df_port_lasso)
+  grafica <- df_mallado |> ggplot() +
+  geom_point(aes(x = desv_estandar, y = media),
+             color = "blue", size = 0.5) +
+  geom_point(data = df_empresas_bajas,
+             aes(x = desv_estandar, y = media), color = "red") +
+  geom_label_repel(data = df_empresas_bajas,
+                   aes(x = desv_estandar, y = media, label = empresa),
+                  box.padding = 0.5, point.padding = 0.6,
+                  max.overlaps = Inf,
+                  size = 2.5, segment.color = 'grey50') +
+  geom_point(data = df_empresas_altas,
+             aes(x = desv_estandar, y = media), color = "forestgreen") +
+  geom_label_repel(data = df_empresas_altas,
+                   aes(x = desv_estandar, y = media, label = empresa),
+                  box.padding = 0.5, point.padding = 0.6,
+                  max.overlaps = Inf,
+                  size = 2.5, segment.color = 'grey50') +
+  geom_point(data = df_ports_especiales,
+             aes(x = desv_estandar, y = media, color = empresa),
+             size = 2) +
+  geom_label_repel(data = df_ports_especiales,
+                   aes(x = desv_estandar,
+                       y = media,
+                       label = empresa),
+                  box.padding = 0.5, point.padding = 0.6,
+                  max.overlaps = Inf,
+                  size = 2.5, segment.color = 'grey50') +
+  #ggtitle("Diagrama desviación estándar & media") +
+  xlab("Desviación estándar") +
+  ylab("Media") +
+  theme_light() +
+  theme(legend.position = "none")
+
+return(grafica)
+}
+```
+
+```{r}
+funcion_graficacion_eigenvalores <- function(df_eigenvalores){
+graf <- df_eigenvalores |> ggplot() + 
+  geom_line(aes(x = num, y = eigenvalor), color = "grey") +
+  geom_point(aes(x = num, y = eigenvalor), color ="seagreen", size = 0.7) + 
+  ylab("") + xlab("") +
+  theme_light()
+return(graf)
+}
+```
+
+```{r}
+funcion_graf_ponds_eigenport <- function(df_ponds_eigens){
+orden_seleccionado <- names(df_ponds_eigens)
+orden_seleccionado <- orden_seleccionado[-1]
+orden_seleccionado <- orden_seleccionado[1:12]
+
+df_ponds_eigens_largo <- df_ponds_eigens |>
+  tidyr::pivot_longer(cols = starts_with("eigenportafolio"), 
+                        names_to = "portafolio", 
+                        values_to = "ponderacion") |>
+  dplyr::filter(portafolio %in% orden_seleccionado) 
+
+df_ponds_eigens_largo$portafolio <- factor(df_ponds_eigens_largo$portafolio,
+                                           levels = orden_seleccionado)
+
+grafica <- df_ponds_eigens_largo |>
+  ggplot() +  geom_tile(aes(x = portafolio, y = empresa, fill=ponderacion)) +
+  scale_fill_distiller(palette = "Spectral", direction = 1) +
+  ylab("") + xlab("") +
+  theme_light() +
+  theme(axis.text.y = element_text(size = 4)) +
+  theme(axis.text.x = element_text(size = 5, angle = 20))
+
+return(grafica)
+}
+```
+
+
+# Ejecuciones
+
+```{r}
+df_descriptivos_ipc <- funcion_descriptivos_ipc(fecha_inicial, fecha_final)
+
+estimados <- funcion_matrizcov_medias(fecha_inicial, fecha_final)
+
+matriz_cov <- estimados[['matriz_cov']]
+matriz_cor <- estimados[['matriz_cor']]
+vector_rend_esp <- estimados[['vector_rend_esp']]
+df_correlaciones <- estimados[['df_correlaciones']]
+
+matriz_cov_un_indice <- funcion_sigma_un_indice(fecha_inicial, fecha_final)
+
+df_desv_rend <- funcion_df_desv_rend(matriz_cov, vector_rend_esp)
+
+df_mallado <- funcion_mallado(matriz_cov, vector_rend_esp)
+
+objeto_min_var <- funcion_port_min_var(matriz_cov, vector_rend_esp)
+objeto_tan <- funcion_port_tan(matriz_cov, vector_rend_esp)
+
+objeto_mv_index <- funcion_port_min_var(matriz_cov_un_indice,
+                                        vector_rend_esp)
+df_mv_index <- objeto_mv_index[['df_min_varianza']]
+df_mv_index$empresa <- "m.v. índice"
+
+objeto_tan_index <- funcion_port_tan(matriz_cov_un_indice,
+                                     vector_rend_esp)
+df_tan_index <- objeto_tan_index[['df_tangencia']]
+df_tan_index$empresa <- "tan. índice"
+
+lista_eigen <- funcion_eigen(matriz_cov)
+df_eigenvectores <- lista_eigen[['df_eigenvectores']]
+df_eigenvalores <- lista_eigen[['df_eigenvalores']]
+eigenvalores <- lista_eigen[['eigenvalores']]
+matriz_eigenvectores <- lista_eigen[['matriz_eigenvectores']]
+
+lista_lasso <- funcion_lasso(df_eigenvectores,
+                          df_desv_rend,
+                          vector_rend_esp,
+                          matriz_eigenvectores,
+                          eigenvalores)
+
+df_port_lasso <- lista_lasso[['df_port_lasso']]
+best_lambda <- lista_lasso[['best_lambda']]
+df_cv_lasso <- lista_lasso[['df_cv_lasso']]
+df_port_lasso <- lista_lasso[['df_port_lasso']]
+eigen_seleccionados <- lista_lasso[['pos_eigenvector']]
+
+print(eigen_seleccionados)
+
+lista_cutoff <- funcion_max_sharpe_cutoff(vector_rend_esp,
+                                          matriz_eigenvectores,
+                                          eigenvalores)
+
+df_ports_aprox <- lista_cutoff[['df_ports_aprox']]
+
+lista_eigenportf <- funcion_calcula_eigenportafolios(matriz_eigenvectores,
+                                             vector_rend_esp,
+                                             matriz_cov)
+
+df_eigens <- lista_eigenportf[['df_eigens']]
+df_ponds_eigens <- lista_eigenportf[['df_ponds_eigens']]
+
+df_metricas_spec_cutoff <- funcion_cutoff(df_eigenvectores,
+                                          df_desv_rend,
+                                          vector_rend_esp)
+
+df_ponderaciones_mv <- objeto_min_var$df_ponderaciones_mv
+df_ponderaciones_T <- objeto_tan$df_ponderaciones_T
+df_ponds_ports_aprox <- lista_cutoff$df_ponds_ports_aprox
+df_ponderaciones_lasso <- lista_lasso$df_ponderaciones_lasso
+```
+
+
+
+
+```{r}
+grafica_bala_inicial <- funcion_graficacion_desv_media(df_descriptivos_ipc,
+                               matriz_cov, vector_rend_esp,
+                               df_desv_rend,
+                               objeto_tan,
+                               objeto_min_var,
+                               df_mv_index,
+                               df_tan_index)
+
+ggsave(plot = grafica_bala_inicial, filename = "frontera_eficiente01_covid.png")
+```
+---
+
+```{r}
+lista_graficas_cutoff <- funcion_graficos_cutoff_delta(df_metricas_spec_cutoff,
+                                          nivel_error = 0.15,
+                                          cruce_delta = 68,
+                                          cruce_aic = 68,
+                                          cruce_bic = 68,
+                                          cruce_rcuad = 61)
+
+lista_graficas_cutoff
+```
+
+
+```{r}
+grafico_delta <- lista_graficas_cutoff[['grafico_delta']]
+grafico_aic <- lista_graficas_cutoff[['grafico_aic']]
+grafico_bic <- lista_graficas_cutoff[['grafico_bic']]
+grafico_r2 <- lista_graficas_cutoff[['grafico_r2']]
+
+ggsave(plot = grafico_delta, filename = "grafico_delta_covid.png")
+ggsave(plot = grafico_aic, filename = "grafico_aic_covid.png")
+ggsave(plot = grafico_bic, filename = "grafico_bic_covid.png")
+ggsave(plot = grafico_r2, filename = "grafico_r2_covid.png")
+```
+
+
+```{r}
+lista_graf_errores_aprox <- funcion_errores_aprox(eigenvalores,
+                                  cruce_prop = 59,
+                                  cruce_frob = 33)
+lista_graf_errores_aprox
+```
+
+```{r}
+graf_prop_expl <- lista_graf_errores_aprox[['graf_prop_expl']]
+graf_error_frobenius <- lista_graf_errores_aprox[['graf_error_frobenius']]
+
+ggsave(plot = graf_prop_expl, filename = "graf_prop_expl_covid.png")
+ggsave(plot = graf_error_frobenius, filename = "graf_error_frobenius_covid.png")
+```
+
+
+```{r}
+grafica_lasso <- funcion_graficacion_cv_lasso(df_cv_lasso, best_lambda)
+
+ggsave(plot = grafica_lasso, filename = "grafica_lasso_covid.png")
+```
+
+
+
+```{r}
+grafica_port_espectrales <- funcion_graficacion_desv_media_cutoff(df_descriptivos_ipc,
+                                           matriz_cov, vector_rend_esp,
+                                           df_desv_rend,
+                                           objeto_tan,
+                                           objeto_min_var,
+                                           df_mv_index,
+                                           df_tan_index,
+                                           k_min = 61,
+                                           k_max = 71,
+                                           df_ports_aprox,
+                                      df_port_lasso
+                                           )
+
+
+ggsave(plot = grafica_port_espectrales,
+       filename = "grafica_port_espectrales_covid.png")
+```
+
+
+```{r}
+grafica_eigenport <- funcion_graficacion_eigenportafolios(df_descriptivos_ipc,
+                                           matriz_cov, vector_rend_esp,
+                                           df_desv_rend,
+                                           objeto_tan,
+                                           objeto_min_var,
+                                           df_mv_index,
+                                           df_tan_index,
+                                           k_min = 61,
+                                           k_max = 71,
+                                           df_ports_aprox,
+                                           cjto_k = c(1,2,10,11,12),
+                                           df_eigens,
+                                     df_port_lasso
+                                           )
+grafica_eigenport
+ggsave(plot = grafica_eigenport, filename = "grafica_eigenport_covid.png")
+```
+
+
+
+```{r}
+grafica_correl <- funcion_graficacion_correlaciones(df_correlaciones)
+
+ggsave(plot = grafica_correl, filename = "grafica_correl_covid.png")
+```
+
+
+
+```{r}
+lista_graf_correls <- funcion_graf_altasbajas_corr(df_correlaciones)
+lista_graf_correls
+```
+
+```{r}
+grafico_corr_alta <- lista_graf_correls[['grafico_corr_alta']]
+grafico_corr_baja <- lista_graf_correls[['grafico_corr_baja']]
+
+ggsave(plot = grafico_corr_alta, filename = "grafico_corr_alta_covid.png")
+ggsave(plot = grafico_corr_baja, filename = "grafico_corr_baja_covid.png")
+```
+
+
+```{r}
+grafica_ponderaciones <- funcion_graficacion_ponderaciones(df_ponderaciones_mv,
+                                              df_ponderaciones_T,
+                                              df_ponds_ports_aprox,
+                                              df_ponderaciones_lasso,
+                                              k_min = 61, 
+                                              k_max = 71)
+
+
+ggsave(plot = grafica_ponderaciones, filename = "grafica_ponderaciones_covid.png")
+```
+
+
+```{r}
+grafica_ponds_lupa <- funcion_grafic_pond_largas_cortas(df_ponderaciones_mv,
+                                            df_ponderaciones_T,
+                                            df_ponds_ports_aprox,
+                                            df_ponderaciones_lasso,
+                                            k_min = 61, k_max = 71)
+grafica_ponds_lupa
+```
+
+```{r}
+grafica_ponds_lupa[['graf_pond_largas']]
+```
+
+
+```{r}
+graf_pond_largas <- grafica_ponds_lupa[['graf_pond_largas']]
+graf_pond_cortas <- grafica_ponds_lupa[['graf_pond_cortas']]
+
+ggsave(plot = graf_pond_largas, filename = "graf_pond_largas_covid.png")
+ggsave(plot = graf_pond_cortas, filename = "graf_pond_cortas_covid.png")
+```
+
+
+```{r}
+graf_verdesrojos <- funcion_graf_verdesrojos(df_descriptivos_ipc,
+                                           matriz_cov, vector_rend_esp,
+                                           df_desv_rend,
+                                           objeto_tan,
+                                           objeto_min_var,
+                                           df_mv_index,
+                                           df_tan_index,
+                                           k_min = 61,
+                                           k_max = 71,
+                                           df_ports_aprox,
+                                           df_port_lasso
+                                           )
+
+ggsave(plot = graf_verdesrojos, filename = "graf_verdesrojos_covid.png")
+```
+
+
+```{r}
+grafica_eigenvalores <- funcion_graficacion_eigenvalores(df_eigenvalores)
+
+ggsave(plot = grafica_eigenvalores, filename = "grafica_eigenvalores_covid.png")
+```
+
+```{r}
+graf_ponds_eigenport <- funcion_graf_ponds_eigenport(df_ponds_eigens)
+
+ggsave(plot = graf_ponds_eigenport, filename = "graf_ponds_eigenport_covid.png")
 ```
